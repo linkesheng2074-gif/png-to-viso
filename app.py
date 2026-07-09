@@ -9,6 +9,7 @@ import base64
 from io import BytesIO
 import html
 import hashlib
+import zipfile
 
 
 # =========================
@@ -21,11 +22,14 @@ st.set_page_config(
 )
 
 st.title("图片转 Visio 可编辑文件 V3")
-st.caption("上传图片 → 原图高保真底图 → 可选识别文字/线条/矩形 → 人工修正 → 导出 SVG，可用 Visio 打开/导入。")
+st.caption(
+    "上传图片 → 原图高保真底图 → 可选识别文字/线条/矩形 → 人工修正 → "
+    "导出 Visio 兼容 ZIP。解压后用 Visio 打开 SVG。"
+)
 
 
 # =========================
-# 基础工具函数
+# 基础参数
 # =========================
 
 DEFAULT_COLUMNS = [
@@ -42,6 +46,10 @@ DEFAULT_COLUMNS = [
     "font_size"
 ]
 
+
+# =========================
+# 基础工具函数
+# =========================
 
 def ensure_df(df: pd.DataFrame) -> pd.DataFrame:
     if df is None or len(df) == 0:
@@ -111,7 +119,6 @@ def preprocess_image(image_np, enhance=True):
 
     gray = cv2.cvtColor(image_np, cv2.COLOR_RGB2GRAY)
 
-    # 轻微增强对比度，便于识别线条和文字
     clahe = cv2.createCLAHE(
         clipLimit=2.0,
         tileGridSize=(8, 8)
@@ -160,7 +167,6 @@ def detect_rectangles(
         if w < 10 or h < 10:
             continue
 
-        # 判断是否接近矩形
         peri = cv2.arcLength(cnt, True)
         approx = cv2.approxPolyDP(cnt, 0.02 * peri, True)
 
@@ -259,7 +265,7 @@ def detect_lines(
 
 def detect_text(
     image: Image.Image,
-    min_conf=75,
+    min_conf=80,
     stroke_color="#0000ff"
 ):
     objects = []
@@ -322,7 +328,7 @@ def detect_text(
 def make_svg(
     width,
     height,
-    image_b64,
+    background_href,
     df,
     keep_background=True,
     background_opacity=1.0,
@@ -330,83 +336,107 @@ def make_svg(
 ):
     svg = []
 
+    svg.append('<?xml version="1.0" encoding="UTF-8" standalone="no"?>')
     svg.append(
         f'<svg xmlns="http://www.w3.org/2000/svg" '
-        f'width="{width}" height="{height}" viewBox="0 0 {width} {height}">'
+        f'xmlns:xlink="http://www.w3.org/1999/xlink" '
+        f'width="{width}px" height="{height}px" '
+        f'viewBox="0 0 {width} {height}" version="1.1">'
     )
 
-    # 原图作为底图，默认 100% 不透明，保证视觉还原
     if keep_background:
         svg.append(
-            f'<image href="data:image/png;base64,{image_b64}" '
-            f'x="0" y="0" width="{width}" height="{height}" '
+            f'<image x="0" y="0" width="{width}" height="{height}" '
+            f'xlink:href="{background_href}" '
+            f'href="{background_href}" '
             f'opacity="{background_opacity}"/>'
         )
 
-    # 默认不显示识别图层，避免 OCR/线条重复覆盖原图
-    if not show_edit_layer:
-        svg.append("</svg>")
-        return "\n".join(svg)
+    if show_edit_layer:
+        df = ensure_df(df)
 
-    df = ensure_df(df)
+        for _, row in df.iterrows():
+            obj_type = str(row.get("type", "")).strip().lower()
 
-    for _, row in df.iterrows():
-        obj_type = str(row.get("type", "")).strip().lower()
+            x = safe_int(row.get("x", 0))
+            y = safe_int(row.get("y", 0))
+            w = safe_int(row.get("w", 0))
+            h = safe_int(row.get("h", 0))
 
-        x = safe_int(row.get("x", 0))
-        y = safe_int(row.get("y", 0))
-        w = safe_int(row.get("w", 0))
-        h = safe_int(row.get("h", 0))
+            stroke = str(row.get("stroke", "#ff0000")).strip()
+            fill = str(row.get("fill", "none")).strip()
+            text = html.escape(str(row.get("text", "")))
+            stroke_width = safe_float(row.get("stroke_width", 1), 1)
+            opacity = safe_float(row.get("opacity", 0.45), 0.45)
+            font_size = safe_int(row.get("font_size", 12), 12)
 
-        stroke = str(row.get("stroke", "#ff0000")).strip()
-        fill = str(row.get("fill", "none")).strip()
-        text = html.escape(str(row.get("text", "")))
-        stroke_width = safe_float(row.get("stroke_width", 1), 1)
-        opacity = safe_float(row.get("opacity", 0.45), 0.45)
-        font_size = safe_int(row.get("font_size", 12), 12)
+            if obj_type == "rect":
+                if w <= 0 or h <= 0:
+                    continue
 
-        if obj_type == "rect":
-            if w <= 0 or h <= 0:
-                continue
+                svg.append(
+                    f'<rect x="{x}" y="{y}" width="{w}" height="{h}" '
+                    f'fill="{fill}" stroke="{stroke}" '
+                    f'stroke-width="{stroke_width}" opacity="{opacity}"/>'
+                )
 
-            svg.append(
-                f'<rect x="{x}" y="{y}" width="{w}" height="{h}" '
-                f'fill="{fill}" stroke="{stroke}" '
-                f'stroke-width="{stroke_width}" opacity="{opacity}"/>'
-            )
+            elif obj_type == "line":
+                svg.append(
+                    f'<line x1="{x}" y1="{y}" x2="{x + w}" y2="{y + h}" '
+                    f'stroke="{stroke}" stroke-width="{stroke_width}" '
+                    f'opacity="{opacity}"/>'
+                )
 
-        elif obj_type == "line":
-            svg.append(
-                f'<line x1="{x}" y1="{y}" x2="{x + w}" y2="{y + h}" '
-                f'stroke="{stroke}" stroke-width="{stroke_width}" '
-                f'opacity="{opacity}"/>'
-            )
+            elif obj_type == "text":
+                if not text:
+                    continue
 
-        elif obj_type == "text":
-            if not text:
-                continue
+                svg.append(
+                    f'<text x="{x}" y="{y + h}" '
+                    f'font-size="{font_size}" '
+                    f'font-family="Arial" '
+                    f'fill="{stroke}" opacity="{opacity}">{text}</text>'
+                )
 
-            svg.append(
-                f'<text x="{x}" y="{y + h}" '
-                f'font-size="{font_size}" '
-                f'font-family="Arial, Microsoft YaHei" '
-                f'fill="{stroke}" opacity="{opacity}">{text}</text>'
-            )
+            elif obj_type == "circle":
+                r = max(1, min(abs(w), abs(h)) // 2)
+                cx = x + r
+                cy = y + r
 
-        elif obj_type == "circle":
-            r = max(1, min(abs(w), abs(h)) // 2)
-            cx = x + r
-            cy = y + r
-
-            svg.append(
-                f'<circle cx="{cx}" cy="{cy}" r="{r}" '
-                f'fill="{fill}" stroke="{stroke}" '
-                f'stroke-width="{stroke_width}" opacity="{opacity}"/>'
-            )
+                svg.append(
+                    f'<circle cx="{cx}" cy="{cy}" r="{r}" '
+                    f'fill="{fill}" stroke="{stroke}" '
+                    f'stroke-width="{stroke_width}" opacity="{opacity}"/>'
+                )
 
     svg.append("</svg>")
-
     return "\n".join(svg)
+
+
+# =========================
+# 生成 ZIP
+# =========================
+
+def make_visio_zip(
+    image: Image.Image,
+    svg_with_background: str,
+    svg_overlay_only: str,
+    json_text: str
+):
+    zip_buffer = BytesIO()
+
+    img_buffer = BytesIO()
+    image.save(img_buffer, format="PNG")
+    img_bytes = img_buffer.getvalue()
+
+    with zipfile.ZipFile(zip_buffer, "w", zipfile.ZIP_DEFLATED) as zf:
+        zf.writestr("background.png", img_bytes)
+        zf.writestr("visio_compatible.svg", svg_with_background.encode("utf-8"))
+        zf.writestr("overlay_only.svg", svg_overlay_only.encode("utf-8"))
+        zf.writestr("recognition_result.json", json_text.encode("utf-8"))
+
+    zip_buffer.seek(0)
+    return zip_buffer.getvalue()
 
 
 # =========================
@@ -492,7 +522,6 @@ image_np = np.array(image)
 width, height = image.size
 
 processed_np = preprocess_image(image_np, enhance=enable_enhance)
-processed_image = Image.fromarray(processed_np)
 
 
 # =========================
@@ -509,7 +538,10 @@ with col1:
 with col2:
     st.subheader("识别控制")
 
-    st.write("建议：复杂封装图、规格书截图，先关闭 OCR，只识别线条/矩形；需要文字时再单独开启 OCR。")
+    st.write(
+        "建议：复杂封装图、规格书截图，先关闭 OCR，只识别线条/矩形；"
+        "需要文字时再单独开启 OCR。"
+    )
 
     run_recognition = st.button(
         "开始识别 / 重新识别",
@@ -543,7 +575,7 @@ if run_recognition or "objects_df" not in st.session_state:
                     stroke_color=overlay_color
                 )
                 objects += rects
-                st.toast(f"矩形识别完成：{len(rects)} 个")
+                st.info(f"矩形识别完成：{len(rects)} 个")
             except Exception as e:
                 st.warning(f"矩形识别失败，已跳过：{e}")
 
@@ -557,7 +589,7 @@ if run_recognition or "objects_df" not in st.session_state:
                     stroke_color=overlay_color
                 )
                 objects += lines
-                st.toast(f"线条识别完成：{len(lines)} 条")
+                st.info(f"线条识别完成：{len(lines)} 条")
             except Exception as e:
                 st.warning(f"线条识别失败，已跳过：{e}")
 
@@ -569,7 +601,7 @@ if run_recognition or "objects_df" not in st.session_state:
                     stroke_color="#0000ff"
                 )
                 objects += texts
-                st.toast(f"文字识别完成：{len(texts)} 个")
+                st.info(f"文字识别完成：{len(texts)} 个")
             except Exception as e:
                 st.warning(f"文字识别失败，已跳过：{e}")
 
@@ -584,7 +616,12 @@ st.divider()
 
 st.subheader("识别结果 / 人工修正")
 
-objects_df = ensure_df(st.session_state.get("objects_df", pd.DataFrame(columns=DEFAULT_COLUMNS)))
+objects_df = ensure_df(
+    st.session_state.get(
+        "objects_df",
+        pd.DataFrame(columns=DEFAULT_COLUMNS)
+    )
+)
 
 edited_df = st.data_editor(
     objects_df,
@@ -604,9 +641,22 @@ edited_df = st.data_editor(
         "text": st.column_config.TextColumn("text"),
         "stroke": st.column_config.TextColumn("stroke"),
         "fill": st.column_config.TextColumn("fill"),
-        "stroke_width": st.column_config.NumberColumn("stroke_width", min_value=0.1, step=0.5),
-        "opacity": st.column_config.NumberColumn("opacity", min_value=0.0, max_value=1.0, step=0.05),
-        "font_size": st.column_config.NumberColumn("font_size", min_value=1, step=1),
+        "stroke_width": st.column_config.NumberColumn(
+            "stroke_width",
+            min_value=0.1,
+            step=0.5
+        ),
+        "opacity": st.column_config.NumberColumn(
+            "opacity",
+            min_value=0.0,
+            max_value=1.0,
+            step=0.05
+        ),
+        "font_size": st.column_config.NumberColumn(
+            "font_size",
+            min_value=1,
+            step=1
+        ),
     },
     key="object_editor"
 )
@@ -615,7 +665,7 @@ st.session_state["objects_df"] = ensure_df(edited_df)
 
 
 # =========================
-# SVG 预览和导出
+# 预览 / 导出
 # =========================
 
 st.divider()
@@ -645,12 +695,14 @@ with preview_col3:
         value=False
     )
 
-image_b64 = image_to_base64(image)
 
-svg_text = make_svg(
+# 页面预览：可以使用 base64，因为这是给网页预览用，不给 Visio 导入
+preview_background_href = f"data:image/png;base64,{image_to_base64(image)}"
+
+preview_svg = make_svg(
     width=width,
     height=height,
-    image_b64=image_b64,
+    background_href=preview_background_href,
     df=st.session_state["objects_df"],
     keep_background=keep_background,
     background_opacity=background_opacity,
@@ -658,29 +710,59 @@ svg_text = make_svg(
 )
 
 components.html(
-    svg_text,
+    preview_svg,
     height=min(height + 80, 900),
     scrolling=True
+)
+
+
+# Visio 导出：不要使用 base64，使用相对路径 background.png
+svg_with_background = make_svg(
+    width=width,
+    height=height,
+    background_href="background.png",
+    df=st.session_state["objects_df"],
+    keep_background=keep_background,
+    background_opacity=background_opacity,
+    show_edit_layer=show_edit_layer
+)
+
+# 纯识别图层版本，兼容性更高，但没有底图
+svg_overlay_only = make_svg(
+    width=width,
+    height=height,
+    background_href="",
+    df=st.session_state["objects_df"],
+    keep_background=False,
+    background_opacity=1.0,
+    show_edit_layer=True
+)
+
+json_text = st.session_state["objects_df"].to_json(
+    orient="records",
+    force_ascii=False,
+    indent=2
+)
+
+zip_bytes = make_visio_zip(
+    image=image,
+    svg_with_background=svg_with_background,
+    svg_overlay_only=svg_overlay_only,
+    json_text=json_text
 )
 
 download_col1, download_col2 = st.columns(2)
 
 with download_col1:
     st.download_button(
-        label="下载 SVG 文件，可用 Visio 打开/导入",
-        data=svg_text.encode("utf-8"),
-        file_name="image_to_visio_editable.svg",
-        mime="image/svg+xml",
+        label="下载 Visio 兼容 ZIP",
+        data=zip_bytes,
+        file_name="visio_compatible_package.zip",
+        mime="application/zip",
         use_container_width=True
     )
 
 with download_col2:
-    json_text = st.session_state["objects_df"].to_json(
-        orient="records",
-        force_ascii=False,
-        indent=2
-    )
-
     st.download_button(
         label="下载识别结果 JSON",
         data=json_text.encode("utf-8"),
@@ -688,3 +770,9 @@ with download_col2:
         mime="application/json",
         use_container_width=True
     )
+
+
+st.info(
+    "使用方法：下载 ZIP 后先解压，保持 background.png 和 visio_compatible.svg 在同一个文件夹，"
+    "然后用 Visio 打开或导入 visio_compatible.svg。"
+)
